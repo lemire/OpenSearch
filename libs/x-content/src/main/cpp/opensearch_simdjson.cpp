@@ -257,16 +257,81 @@ inline uint32_t read_digits(const uint8_t *b, uint32_t i, uint32_t end, uint64_t
   return i;
 }
 
+#if defined(__SIZEOF_INT128__)
+inline double bits_to_double(uint64_t mantissa, uint64_t real_exponent, bool negative) {
+  double d;
+  mantissa &= ~(1ULL << 52);
+  mantissa |= real_exponent << 52;
+  mantissa |= uint64_t(negative) << 63;
+  std::memcpy(&d, &mantissa, sizeof(d));
+  return d;
+}
+
+/*
+ * The Eisel-Lemire algorithm: the correctly rounded double nearest to
+ * i * 10^power, for a nonzero i of at most 19 digits. Returns false when it
+ * cannot decide or the value overflows. This is compute_float_64 of simdjson
+ * (Apache License 2.0), without its Clinger fast path, which the caller
+ * tries first.
+ */
+inline bool eisel_lemire(int64_t power, uint64_t i, bool negative, double &d) {
+  if (power < simdjson::internal::smallest_power || power > simdjson::internal::largest_power) { return false; }
+  int64_t exponent = (((152170 + 65536) * power) >> 16) + 1024 + 63;
+  int lz = __builtin_clzll(i);
+  i <<= lz;
+  const uint32_t index = 2 * uint32_t(power - simdjson::internal::smallest_power);
+  unsigned __int128 first = (unsigned __int128)i * simdjson::internal::power_of_five_128[index];
+  uint64_t upper = uint64_t(first >> 64);
+  uint64_t lower = uint64_t(first);
+  if ((upper & 0x1FF) == 0x1FF) {
+    unsigned __int128 second = (unsigned __int128)i * simdjson::internal::power_of_five_128[index + 1];
+    uint64_t second_high = uint64_t(second >> 64);
+    lower += second_high;
+    if (second_high > lower) { upper++; }
+  }
+  uint64_t upperbit = upper >> 63;
+  uint64_t mantissa = upper >> (upperbit + 9);
+  lz += int(1 ^ upperbit);
+  int64_t real_exponent = exponent - lz;
+  if (real_exponent <= 0) {
+    // a subnormal
+    if (-real_exponent + 1 >= 64) {
+      d = negative ? -0.0 : 0.0;
+      return true;
+    }
+    mantissa >>= -real_exponent + 1;
+    mantissa += (mantissa & 1);
+    mantissa >>= 1;
+    real_exponent = (mantissa < (uint64_t(1) << 52)) ? 0 : 1;
+    d = bits_to_double(mantissa, uint64_t(real_exponent), negative);
+    return true;
+  }
+  if ((lower <= 1) && (power >= -4) && (power <= 23) && ((mantissa & 3) == 1)) {
+    // exactly halfway between two doubles: round to even
+    if ((mantissa << (upperbit + 64 - 53 - 2)) == upper) { mantissa &= ~uint64_t(1); }
+  }
+  mantissa += mantissa & 1;
+  mantissa >>= 1;
+  if (mantissa >= (uint64_t(1) << 53)) {
+    mantissa = uint64_t(1) << 52;
+    real_exponent++;
+  }
+  mantissa &= ~(uint64_t(1) << 52);
+  if (real_exponent > 2046) { return false; }
+  d = bits_to_double(mantissa, uint64_t(real_exponent), negative);
+  return true;
+}
+#endif
+
 const double POWERS_OF_TEN[] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
                                 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
 
 /*
- * Validates the JSON number b[p, e) and computes its value when that is
- * simple: an integer that fits an int64, or a decimal whose significand
- * (at most 2^53) and power of ten (at most 22) are exact doubles, so that one
- * correctly rounded operation (Clinger's fast path) gives the correctly
- * rounded value, as Jackson's parser does. Returns the kind (with
- * NUMBER_VALUE when value is set), or 0 when it is not a JSON number.
+ * Validates the JSON number b[p, e) and computes its value: an integer that
+ * fits an int64, or a decimal with at most 19 significant digits, whose
+ * correctly rounded double (Jackson's parser also rounds correctly) comes from
+ * Clinger's fast path or from the Eisel-Lemire algorithm. Returns the kind
+ * (with NUMBER_VALUE when value is set), or 0 when it is not a JSON number.
  */
 inline int32_t parse_number(const uint8_t *b, uint32_t p, uint32_t e, uint32_t end, uint64_t &value) {
   uint32_t i = p;
@@ -324,14 +389,23 @@ inline int32_t parse_number(const uint8_t *b, uint32_t p, uint32_t e, uint32_t e
     exponent += negative_exponent ? -x : x;
   }
   if (i != e) { return 0; }
-  if (exact && mantissa <= (uint64_t(1) << 53) && exponent >= -22 && exponent <= 22) {
-    double d = double(mantissa);
+  if (!exact) { return FLOAT; }
+  double d;
+  if (mantissa <= (uint64_t(1) << 53) && exponent >= -22 && exponent <= 22) {
+    d = double(mantissa);
     d = exponent < 0 ? d / POWERS_OF_TEN[-exponent] : d * POWERS_OF_TEN[exponent];
     if (negative) { d = -d; }
-    std::memcpy(&value, &d, 8);
-    return FLOAT | NUMBER_VALUE;
+  } else if (mantissa == 0) {
+    d = negative ? -0.0 : 0.0;
+  } else {
+#if defined(__SIZEOF_INT128__)
+    if (!eisel_lemire(exponent, mantissa, negative, d)) { return FLOAT; }
+#else
+    return FLOAT;
+#endif
   }
-  return FLOAT;
+  std::memcpy(&value, &d, 8);
+  return FLOAT | NUMBER_VALUE;
 }
 
 inline uint8_t *write_utf8(uint8_t *o, uint32_t cp) {
