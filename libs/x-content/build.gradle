@@ -68,3 +68,104 @@ tasks.named("dependencyLicenses").configure {
 }
 
 jarHell.enabled = false
+
+// Native JSON tokenizer (src/main/cpp), compiled for the host platform and packaged as a
+// resource that SimdJsonNative extracts at run time. It is optional: without a C++ compiler,
+// or offline without the simdjson sources in the build directory, the jar has no library and
+// JSON is parsed with Jackson. -Dbuild.simdjson=false skips it.
+def simdjsonVersion = '5.3.0'
+def simdjsonChecksums = [
+  'simdjson.h'  : 'd2a524c7614cb841b7d4d64576990c7adebc7075fa2ca46b7da2e3390e32f48d',
+  'simdjson.cpp': 'dc1fbb68da44d1886e2c44451650f2082e7afca2f504f1bdffbef3d0634c71bf'
+]
+def simdjsonSourceDir = layout.buildDirectory.dir("simdjson-${simdjsonVersion}")
+def simdjsonResourceDir = layout.buildDirectory.dir('generated-resources/simdjson')
+
+def nativePlatform = {
+  def os = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+  def arch = System.getProperty('os.arch').toLowerCase(Locale.ROOT)
+  arch = (arch in ['amd64', 'x86_64']) ? 'x86_64' : ((arch in ['arm64', 'aarch64']) ? 'aarch64' : arch)
+  os = os.startsWith('linux') ? 'linux' : (os.startsWith('mac') ? 'darwin' : (os.startsWith('windows') ? 'windows' : os))
+  return [os: os, arch: arch]
+}
+
+def sha256 = { File file ->
+  def digest = java.security.MessageDigest.getInstance('SHA-256')
+  file.eachByte(64 * 1024) { buffer, length -> digest.update(buffer, 0, length) }
+  return digest.digest().encodeHex().toString()
+}
+
+def buildSimdJsonNative = tasks.register('buildSimdJsonNative') {
+  description = 'Compiles the native JSON tokenizer (simdjson) for the host platform'
+  def sourceFile = file('src/main/cpp/opensearch_simdjson.cpp')
+  def enabled = System.getProperty('build.simdjson', 'true') != 'false'
+  def offline = gradle.startParameter.offline
+  inputs.file sourceFile
+  inputs.property 'simdjsonVersion', simdjsonVersion
+  inputs.property 'enabled', enabled
+  inputs.property 'compiler', System.getenv('CXX') ?: 'c++'
+  outputs.dir simdjsonResourceDir
+  doLast {
+    def outputDir = simdjsonResourceDir.get().asFile
+    outputDir.deleteDir()
+    outputDir.mkdirs()
+    def platform = nativePlatform()
+    if (enabled == false || platform.os == 'windows') {
+      logger.lifecycle("Skipping the native JSON tokenizer (enabled: ${enabled}, platform: ${platform.os})")
+      return
+    }
+    def sources = simdjsonSourceDir.get().asFile
+    sources.mkdirs()
+    for (entry in simdjsonChecksums) {
+      def target = new File(sources, entry.key)
+      if (target.exists() == false || sha256(target) != entry.value) {
+        if (offline) {
+          logger.lifecycle("Skipping the native JSON tokenizer: offline and ${target} is missing")
+          return
+        }
+        def url = "https://raw.githubusercontent.com/simdjson/simdjson/v${simdjsonVersion}/singleheader/${entry.key}"
+        try {
+          new URL(url).withInputStream { input -> target.withOutputStream { output -> output << input } }
+        } catch (IOException e) {
+          logger.warn("Skipping the native JSON tokenizer: cannot download ${url}: ${e}")
+          return
+        }
+        if (sha256(target) != entry.value) {
+          target.delete()
+          throw new GradleException("Checksum mismatch for ${url}")
+        }
+      }
+    }
+    def compiler = System.getenv('CXX') ?: 'c++'
+    def libraryFile = platform.os == 'darwin' ? 'libopensearch_simdjson.dylib' : 'libopensearch_simdjson.so'
+    def libraryDir = new File(outputDir, "org/opensearch/common/xcontent/json/native/${platform.os}-${platform.arch}")
+    libraryDir.mkdirs()
+    def command = [compiler, '-O3', '-std=c++17', '-shared', '-fPIC', '-fvisibility=hidden', '-DNDEBUG',
+                   "-I${sources}", '-o', new File(libraryDir, libraryFile).absolutePath,
+                   sourceFile.absolutePath, new File(sources, 'simdjson.cpp').absolutePath]
+    if (platform.os == 'linux') {
+      // no dependency on the libstdc++ of the build host
+      command += ['-static-libstdc++', '-static-libgcc', '-Wl,--no-undefined']
+    }
+    def process
+    try {
+      process = new ProcessBuilder(command.collect { it.toString() }).redirectErrorStream(true).start()
+    } catch (IOException e) {
+      libraryDir.deleteDir()
+      logger.lifecycle("Skipping the native JSON tokenizer: cannot run ${compiler}: ${e.message}")
+      return
+    }
+    def output = process.inputStream.text
+    if (process.waitFor() != 0) {
+      libraryDir.deleteDir()
+      logger.warn("Skipping the native JSON tokenizer: ${compiler} failed:\n${output}")
+    }
+  }
+}
+
+sourceSets.main.resources.srcDir(files(simdjsonResourceDir).builtBy(buildSimdJsonNative))
+
+tasks.withType(Test).configureEach {
+  // run the tests with the simdjson parser; they also exercise Jackson for the documents it falls back on
+  systemProperty 'opensearch.xcontent.json.simdjson', System.getProperty('tests.simdjson', 'true')
+}

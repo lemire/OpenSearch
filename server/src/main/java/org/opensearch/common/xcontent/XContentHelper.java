@@ -32,8 +32,10 @@
 
 package org.opensearch.common.xcontent;
 
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.common.collect.Tuple;
+import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.compress.Compressor;
@@ -123,6 +125,11 @@ public class XContentHelper {
             if (bytes instanceof BytesArray array) {
                 return mediaType.xContent()
                     .createParser(xContentRegistry, deprecationHandler, array.array(), array.offset(), array.length());
+            }
+            if (mediaType == XContentType.JSON && JsonXContent.isSimdJsonEnabled()) {
+                // simdjson needs the document in one array: a view when the bytes are contiguous, else a copy
+                BytesRef ref = bytes.toBytesRef();
+                return mediaType.xContent().createParser(xContentRegistry, deprecationHandler, ref.bytes, ref.offset, ref.length);
             }
             return mediaType.xContent().createParser(xContentRegistry, deprecationHandler, bytes.streamInput());
         }

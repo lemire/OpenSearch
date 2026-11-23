@@ -96,6 +96,34 @@ public class JsonXContent implements XContent, XContentConstraints {
         jsonXContent = new JsonXContent();
     }
 
+    /**
+     * System property that enables the simdjson parser for JSON in byte arrays: {@code true} or {@code false}
+     * (the default). It takes effect when the native library loads, on Java 22 or later.
+     */
+    public static final String SIMDJSON_PROPERTY = "opensearch.xcontent.json.simdjson";
+
+    private static final boolean SIMDJSON = Boolean.parseBoolean(System.getProperty(SIMDJSON_PROPERTY, "false"))
+        && SimdJsonNative.isAvailable();
+
+    /** Whether JSON in byte arrays is parsed with simdjson. */
+    public static boolean isSimdJsonEnabled() {
+        return SIMDJSON;
+    }
+
+    /**
+     * A description of the simdjson parser state for the node startup log: the SIMD kernel in use when it is
+     * enabled, otherwise why it is not.
+     */
+    public static String simdJsonStatus() {
+        if (SIMDJSON) {
+            return "enabled (" + SimdJsonNative.implementation() + ")";
+        }
+        if (Boolean.parseBoolean(System.getProperty(SIMDJSON_PROPERTY, "false")) == false) {
+            return "disabled";
+        }
+        return "unavailable: " + SimdJsonNative.unavailableReason();
+    }
+
     private JsonXContent() {}
 
     @Override
@@ -134,7 +162,7 @@ public class JsonXContent implements XContent, XContentConstraints {
     @Override
     public XContentParser createParser(NamedXContentRegistry xContentRegistry, DeprecationHandler deprecationHandler, byte[] data)
         throws IOException {
-        return new JsonXContentParser(xContentRegistry, deprecationHandler, jsonFactory.createParser(XObjectReadContext.create(), data));
+        return createParser(xContentRegistry, deprecationHandler, data, 0, data.length);
     }
 
     @Override
@@ -145,11 +173,22 @@ public class JsonXContent implements XContent, XContentConstraints {
         int offset,
         int length
     ) throws IOException {
+        if (SIMDJSON) {
+            XContentParser parser = SimdJsonXContentParser.create(xContentRegistry, deprecationHandler, data, offset, length);
+            if (parser != null) {
+                return parser;
+            }
+        }
         return new JsonXContentParser(
             xContentRegistry,
             deprecationHandler,
             jsonFactory.createParser(XObjectReadContext.create(), data, offset, length)
         );
+    }
+
+    /** A Jackson parser, even when simdjson is enabled. */
+    JsonXContentParser createJacksonParser(NamedXContentRegistry xContentRegistry, DeprecationHandler deprecationHandler, byte[] data) {
+        return new JsonXContentParser(xContentRegistry, deprecationHandler, jsonFactory.createParser(XObjectReadContext.create(), data));
     }
 
     @Override
