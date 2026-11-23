@@ -126,7 +126,7 @@ public class XContentHelper {
                 return mediaType.xContent()
                     .createParser(xContentRegistry, deprecationHandler, array.array(), array.offset(), array.length());
             }
-            if (mediaType == XContentType.JSON && JsonXContent.isSimdJsonEnabled()) {
+            if (mediaType == XContentType.JSON && JsonXContent.usesSimdJson(bytes.length())) {
                 // simdjson needs the document in one array: a view when the bytes are contiguous, else a copy
                 BytesRef ref = bytes.toBytesRef();
                 return mediaType.xContent().createParser(xContentRegistry, deprecationHandler, ref.bytes, ref.offset, ref.length);
@@ -182,6 +182,14 @@ public class XContentHelper {
                 final int length = arr.length();
                 contentType = mediaType != null ? mediaType : MediaTypeRegistry.mediaTypeFromBytes(raw, offset, length);
                 return new Tuple<>(Objects.requireNonNull(contentType), convertToMap(contentType.xContent(), raw, offset, length, ordered));
+            } else if (JsonXContent.usesSimdJson(bytes.length()) && (mediaType == null || mediaType == XContentType.JSON)) {
+                // simdjson needs the document in one array: a view when the bytes are contiguous, else a copy
+                BytesRef ref = bytes.toBytesRef();
+                contentType = mediaType != null ? mediaType : MediaTypeRegistry.mediaTypeFromBytes(ref.bytes, ref.offset, ref.length);
+                return new Tuple<>(
+                    Objects.requireNonNull(contentType),
+                    convertToMap(contentType.xContent(), ref.bytes, ref.offset, ref.length, ordered)
+                );
             } else {
                 input = bytes.streamInput();
             }

@@ -131,6 +131,7 @@ import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.PageCacheRecycler;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.Assertions;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -563,6 +564,7 @@ public class Node implements Closeable {
                 );
             }
             logger.info("JVM arguments {}", Arrays.toString(jvmInfo.getInputArguments()));
+            logger.info("simdjson JSON parser [{}]", JsonXContent.simdJsonStatus());
             if (Build.CURRENT.isProductionRelease() == false) {
                 logger.warn(
                     "version [{}] is a pre-release version of OpenSearch and is not suitable for production",

@@ -51,6 +51,8 @@ dependencies {
     // us to invoke the JMH uberjar as usual.
     exclude group: 'net.sf.jopt-simple', module: 'jopt-simple'
   }
+  // field types of the OpenSearch Benchmark workloads, such as scaled_float, for DocumentParsingBenchmark
+  api project(':modules:mapper-extras')
   api "org.openjdk.jmh:jmh-core:$versions.jmh"
   annotationProcessor "org.openjdk.jmh:jmh-generator-annprocess:$versions.jmh"
   // Dependencies of JMH

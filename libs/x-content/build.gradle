@@ -144,8 +144,11 @@ def buildSimdJsonNative = tasks.register('buildSimdJsonNative') {
                    "-I${sources}", '-o', new File(libraryDir, libraryFile).absolutePath,
                    sourceFile.absolutePath, new File(sources, 'simdjson.cpp').absolutePath]
     if (platform.os == 'linux') {
-      // no dependency on the libstdc++ of the build host
-      command += ['-static-libstdc++', '-static-libgcc', '-Wl,--no-undefined']
+      // no dependency on the libstdc++ of the build host; drop unused code and symbols (2 MB instead of 10 MB)
+      command += ['-static-libstdc++', '-static-libgcc', '-Wl,--no-undefined',
+                  '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections', '-s']
+    } else if (platform.os == 'darwin') {
+      command += ['-Wl,-dead_strip']
     }
     def process
     try {

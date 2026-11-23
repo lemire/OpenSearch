@@ -167,6 +167,12 @@ public interface XContentGenerator extends Closeable, Flushable {
                     case DOUBLE:
                         writeNumber(parser.doubleValue());
                         break;
+                    case BIG_INTEGER:
+                        writeNumber(parser.bigIntegerValue());
+                        break;
+                    case BIG_DECIMAL:
+                        writeNumber((BigDecimal) parser.numberValue());
+                        break;
                 }
                 break;
             case VALUE_BOOLEAN:

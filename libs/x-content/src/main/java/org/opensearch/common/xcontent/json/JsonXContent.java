@@ -105,9 +105,22 @@ public class JsonXContent implements XContent, XContentConstraints {
     private static final boolean SIMDJSON = Boolean.parseBoolean(System.getProperty(SIMDJSON_PROPERTY, "false"))
         && SimdJsonNative.isAvailable();
 
+    /**
+     * Larger documents are parsed with Jackson, which streams them, rather than with simdjson, which needs
+     * 16 bytes of tokens per structural character of a document.
+     */
+    static final int SIMDJSON_MAX_DOCUMENT_BYTES = Integer.parseInt(
+        System.getProperty(SIMDJSON_PROPERTY + ".max_document_bytes", Integer.toString(8 << 20))
+    );
+
     /** Whether JSON in byte arrays is parsed with simdjson. */
     public static boolean isSimdJsonEnabled() {
         return SIMDJSON;
+    }
+
+    /** Whether a JSON document of this many bytes, in a byte array, is parsed with simdjson. */
+    public static boolean usesSimdJson(int length) {
+        return SIMDJSON && length <= SIMDJSON_MAX_DOCUMENT_BYTES;
     }
 
     /**
@@ -173,7 +186,7 @@ public class JsonXContent implements XContent, XContentConstraints {
         int offset,
         int length
     ) throws IOException {
-        if (SIMDJSON) {
+        if (usesSimdJson(length)) {
             XContentParser parser = SimdJsonXContentParser.create(xContentRegistry, deprecationHandler, data, offset, length);
             if (parser != null) {
                 return parser;
