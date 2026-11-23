@@ -16,8 +16,11 @@ import org.opensearch.core.xcontent.XContentLocation;
 import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.ByteOrder;
 import java.nio.CharBuffer;
 import java.nio.charset.StandardCharsets;
 
@@ -55,6 +58,9 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
     /** Set on a string or a field name whose content had escapes: it is decoded in the scratch buffer. */
     private static final int ESCAPED = 0x40;
     private static final int KIND_MASK = 0x3F;
+    /** Set on an INT or a FLOAT whose value (an int64, or the bits of the double) is in the token. */
+    private static final int NUMBER_VALUE = 0x80;
+    private static final VarHandle NATIVE_INT = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.nativeOrder());
 
     private static final Token[] TOKENS = {
         null,
@@ -71,30 +77,6 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
         Token.VALUE_NULL };
 
     private static final float[] FLOAT_POWERS = { 1e0f, 1e1f, 1e2f, 1e3f, 1e4f, 1e5f, 1e6f, 1e7f, 1e8f, 1e9f, 1e10f };
-    private static final double[] DOUBLE_POWERS = {
-        1e0,
-        1e1,
-        1e2,
-        1e3,
-        1e4,
-        1e5,
-        1e6,
-        1e7,
-        1e8,
-        1e9,
-        1e10,
-        1e11,
-        1e12,
-        1e13,
-        1e14,
-        1e15,
-        1e16,
-        1e17,
-        1e18,
-        1e19,
-        1e20,
-        1e21,
-        1e22 };
 
     private SimdJsonParserState state;
     private final byte[] buf;
@@ -103,7 +85,6 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
     private final int[] tokens;
     private final byte[] scratch;
     private final int tokenCount;
-    private final SimdJsonParserState.NameCache names;
     private String[] contextNames;
     private boolean[] contextArrays;
 
@@ -112,7 +93,11 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
     /** Kind of the current token, with the ESCAPED flag, or 0 when there is none. */
     private int kind;
     private int start;
+    /** End of the current token; -1 for a number until {@link #numberEnd()} finds it. */
     private int end;
+    /** The value of the current number when numberParsed: an int64 for an INT, the bits of the double for a FLOAT. */
+    private long numberValue;
+    private boolean numberParsed;
     private int depth;
     /** textCharacters() of the current token, built on demand. */
     private char[] chars;
@@ -140,7 +125,6 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
         this.tokens = state.tokens;
         this.scratch = state.scratch;
         this.tokenCount = tokenCount;
-        this.names = state.names;
         this.contextNames = state.contextNames;
         this.contextArrays = state.contextArrays;
         contextNames[0] = null;
@@ -192,26 +176,34 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
         final int[] tokens = this.tokens;
         final int base = p << 2;
         final int k = tokens[base];
-        kind = k;
+        kind = k & (KIND_MASK | ESCAPED);
         start = tokens[base + 1];
-        end = tokens[base + 2];
         switch (k & KIND_MASK) {
             case START_OBJECT:
+                end = start + 1;
                 push(false);
                 break;
             case START_ARRAY:
+                end = start + 1;
                 push(true);
                 break;
             case END_OBJECT:
             case END_ARRAY:
+                end = start + 1;
                 depth--;
                 break;
             case FIELD_NAME:
-                contextNames[depth] = (k & ESCAPED) == 0
-                    ? names.lookup(buf, start, end - start, tokens[base + 3])
-                    : names.lookup(scratch, start, end - start);
+                end = tokens[base + 2];
+                contextNames[depth] = state.name(tokens[base + 3], (k & ESCAPED) == 0 ? buf : scratch, start, end - start);
+                break;
+            case INT:
+            case FLOAT:
+                end = -1;
+                numberParsed = (k & NUMBER_VALUE) != 0;
+                numberValue = (tokens[base + 2] & 0xFFFFFFFFL) | ((long) tokens[base + 3] << 32);
                 break;
             default:
+                end = tokens[base + 2];
                 break;
         }
         return TOKENS[k & KIND_MASK];
@@ -237,7 +229,7 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
             pos = tokens[(pos << 2) + 3];
             kind = kind + 1;
             start = tokens[(pos << 2) + 1];
-            end = tokens[(pos << 2) + 2];
+            end = start + 1;
             depth--;
         }
     }
@@ -284,7 +276,7 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
                 return new String(scratch, start, end - start, StandardCharsets.UTF_8);
             case INT:
             case FLOAT:
-                return new String(buf, start, end - start, StandardCharsets.ISO_8859_1);
+                return new String(buf, start, numberEnd() - start, StandardCharsets.ISO_8859_1);
             case TRUE:
                 return "true";
             case FALSE:
@@ -379,48 +371,41 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
         return 0;
     }
 
-    /** Digits of the current INT token, without the sign. */
-    private int digits() {
-        return end - start - (buf[start] == '-' ? 1 : 0);
-    }
-
-    /** The current INT token, which has at most 18 digits. */
-    private long smallLong() {
-        final byte[] b = buf;
-        int i = start;
-        final boolean negative = b[i] == '-';
-        if (negative) {
-            i++;
+    /** The end of the current number, found by scanning its characters the first time. */
+    private int numberEnd() {
+        if (end < 0) {
+            int e = start;
+            final byte[] b = buf;
+            while (e < b.length) {
+                byte c = b[e];
+                if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
+                    e++;
+                } else {
+                    break;
+                }
+            }
+            end = e;
         }
-        long value = 0;
-        for (final int e = end; i < e; i++) {
-            value = value * 10 + (b[i] - '0');
-        }
-        return negative ? -value : value;
+        return end;
     }
 
     @Override
     public Number numberValue() throws IOException {
-        if (kind == INT) {
-            int digits = digits();
-            if (digits <= 9) {
-                return (int) smallLong();
+        if (kind == INT && numberParsed) {
+            long value = numberValue;
+            if (value == (int) value) {
+                return (int) value;
             }
-            if (digits <= 18) {
-                long value = smallLong();
-                if (value == (int) value) {
-                    return (int) value;
-                }
-                return value;
-            }
-        } else if (kind == FLOAT) {
+            return value;
+        }
+        if (kind == FLOAT) {
             if (decimalRead) {
                 return new BigDecimal(currentText());
             }
             if (floatRead) {
                 return parseFloat();
             }
-            return parseDouble();
+            return doDoubleValue();
         }
         try (JsonXContentParser jackson = jacksonAtCurrentToken()) {
             return jackson.numberValue();
@@ -429,16 +414,10 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     public NumberType numberType() throws IOException {
-        if (kind == INT) {
-            int digits = digits();
-            if (digits <= 9) {
-                return NumberType.INT;
-            }
-            if (digits <= 18) {
-                long value = smallLong();
-                return value == (int) value ? NumberType.INT : NumberType.LONG;
-            }
-        } else if (kind == FLOAT) {
+        if (kind == INT && numberParsed) {
+            return numberValue == (int) numberValue ? NumberType.INT : NumberType.LONG;
+        }
+        if (kind == FLOAT) {
             return decimalRead ? NumberType.BIG_DECIMAL : (floatRead ? NumberType.FLOAT : NumberType.DOUBLE);
         }
         try (JsonXContentParser jackson = jacksonAtCurrentToken()) {
@@ -448,8 +427,8 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     protected short doShortValue() throws IOException {
-        if (kind == INT && digits() <= 4) {
-            return (short) smallLong();
+        if (kind == INT && numberParsed && numberValue == (short) numberValue) {
+            return (short) numberValue;
         }
         try (JsonXContentParser jackson = jacksonAtCurrentToken()) {
             return jackson.doShortValue();
@@ -458,8 +437,8 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     protected int doIntValue() throws IOException {
-        if (kind == INT && digits() <= 9) {
-            return (int) smallLong();
+        if (kind == INT && numberParsed && numberValue == (int) numberValue) {
+            return (int) numberValue;
         }
         try (JsonXContentParser jackson = jacksonAtCurrentToken()) {
             return jackson.doIntValue();
@@ -468,8 +447,8 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     protected long doLongValue() throws IOException {
-        if (kind == INT && digits() <= 18) {
-            return smallLong();
+        if (kind == INT && numberParsed) {
+            return numberValue;
         }
         try (JsonXContentParser jackson = jacksonAtCurrentToken()) {
             return jackson.doLongValue();
@@ -478,8 +457,8 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     protected float doFloatValue() throws IOException {
-        if (kind == INT && digits() <= 18) {
-            return (float) smallLong();
+        if (kind == INT && numberParsed) {
+            return (float) numberValue;
         }
         if (kind == FLOAT) {
             floatRead = true;
@@ -492,11 +471,12 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     protected double doDoubleValue() throws IOException {
-        if (kind == INT && digits() <= 18) {
-            return (double) smallLong();
+        if (kind == INT && numberParsed) {
+            return (double) numberValue;
         }
         if (kind == FLOAT) {
-            return parseDouble();
+            // the native side computed the value when Clinger's fast path applies; other values go to Jackson's parser
+            return numberParsed ? Double.longBitsToDouble(numberValue) : NumberInput.parseDouble(currentText(), true);
         }
         try (JsonXContentParser jackson = jacksonAtCurrentToken()) {
             return jackson.doDoubleValue();
@@ -505,8 +485,8 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
 
     @Override
     protected BigInteger doBigIntegerValue() throws IOException {
-        if (kind == INT && digits() <= 18) {
-            return BigInteger.valueOf(smallLong());
+        if (kind == INT && numberParsed) {
+            return BigInteger.valueOf(numberValue);
         }
         if (kind == FLOAT) {
             // Jackson reads a float token as a BigDecimal here
@@ -518,13 +498,14 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
     }
 
     /**
-     * Decimal significand and power of ten of the current FLOAT token, in decimal[0] and decimal[1], when
-     * the significand has at most 19 digits. Returns false otherwise.
+     * The float value of the current FLOAT token. Clinger's fast path: when the significand (at most 2^24) and the
+     * power of ten (at most 10 in magnitude) are exact floats, one correctly rounded operation gives the correctly
+     * rounded value, which Jackson's parser also returns. Other numbers go to Jackson's parser.
      */
-    private boolean decimal(long[] decimal) {
+    private float parseFloat() {
         final byte[] b = buf;
+        final int e = numberEnd();
         int i = start;
-        final int e = end;
         if (b[i] == '-') {
             i++;
         }
@@ -557,44 +538,11 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
             }
             exponent += negative ? -value : value;
         }
-        // digits counts the leading zeros, so 19 digits never overflow
-        if (digits > 19) {
-            return false;
-        }
-        decimal[0] = significand;
-        decimal[1] = exponent;
-        return true;
-    }
-
-    private final long[] decimal = new long[2];
-
-    /**
-     * Clinger's fast path: when the significand and the power of ten are both exact doubles (floats),
-     * a single correctly rounded multiplication or division gives the correctly rounded result, the value
-     * Jackson's parser returns. Other numbers go to Jackson's parser.
-     */
-    private double parseDouble() {
-        if (decimal(decimal)) {
-            long significand = decimal[0];
-            int exponent = (int) decimal[1];
-            if (significand <= (1L << 53) && exponent >= -22 && exponent <= 22) {
-                double d = (double) significand;
-                d = exponent < 0 ? d / DOUBLE_POWERS[-exponent] : d * DOUBLE_POWERS[exponent];
-                return buf[start] == '-' ? -d : d;
-            }
-        }
-        return NumberInput.parseDouble(currentText(), true);
-    }
-
-    private float parseFloat() {
-        if (decimal(decimal)) {
-            long significand = decimal[0];
-            int exponent = (int) decimal[1];
-            if (significand <= (1L << 24) && exponent >= -10 && exponent <= 10) {
-                float f = (float) significand;
-                f = exponent < 0 ? f / FLOAT_POWERS[-exponent] : f * FLOAT_POWERS[exponent];
-                return buf[start] == '-' ? -f : f;
-            }
+        // digits counts the leading zeros, so 18 digits never overflow
+        if (digits <= 18 && significand <= (1L << 24) && exponent >= -10 && exponent <= 10) {
+            float f = (float) significand;
+            f = exponent < 0 ? f / FLOAT_POWERS[-exponent] : f * FLOAT_POWERS[exponent];
+            return b[start] == '-' ? -f : f;
         }
         return NumberInput.parseFloat(currentText(), true);
     }
@@ -649,6 +597,11 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
                 doc = rawString();
                 advance = 1;
                 break;
+            case INT:
+            case FLOAT:
+                doc = java.util.Arrays.copyOfRange(buf, start, numberEnd());
+                advance = 1;
+                break;
             default:
                 doc = java.util.Arrays.copyOfRange(buf, start, end);
                 advance = 1;
@@ -665,7 +618,7 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
         if ((kind & ESCAPED) == 0) {
             return java.util.Arrays.copyOfRange(buf, start - 1, end + 1);
         }
-        int quote = tokens[(pos << 2) + 3];
+        int quote = quotePosition();
         int i = quote + 1;
         while (buf[i] != '"') {
             i += buf[i] == '\\' ? 2 : 1;
@@ -689,9 +642,24 @@ final class SimdJsonXContentParser extends AbstractXContentParser {
                 return start;
             case FIELD_NAME:
                 return start - 1;
+            case FIELD_NAME | ESCAPED:
+            case STRING | ESCAPED:
+                return quotePosition();
+            case STRING:
+                return start - 1;
             default:
-                return tokens[(pos << 2) + 3];
+                // numbers and atoms
+                return start;
         }
+    }
+
+    /** The position in buf of the opening quote of the current escaped string or field name. */
+    private int quotePosition() {
+        if (kind == (FIELD_NAME | ESCAPED)) {
+            // the native side stores it in the 4 bytes before the decoded name
+            return (int) NATIVE_INT.get(scratch, start - 4);
+        }
+        return tokens[(pos << 2) + 3];
     }
 
     // Line counting state of the last getTokenLocation() call, to continue from there.

@@ -166,7 +166,8 @@ def buildSimdJsonNative = tasks.register('buildSimdJsonNative') {
   }
 }
 
-sourceSets.main.resources.srcDir(files(simdjsonResourceDir).builtBy(buildSimdJsonNative))
+// an output directory rather than a resource directory: the binary is not a source file for the precommit checks
+sourceSets.main.output.dir(simdjsonResourceDir, builtBy: buildSimdJsonNative)
 
 tasks.withType(Test).configureEach {
   // run the tests with the simdjson parser; they also exercise Jackson for the documents it falls back on

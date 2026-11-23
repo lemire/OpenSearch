@@ -33,17 +33,37 @@ final class SimdJsonParserState {
     private final Object context;
     private int contextCapacity;
 
-    int[] tokens = new int[4 * 1024];
-    byte[] scratch = new byte[INITIAL_CAPACITY];
-    final NameCache names = new NameCache();
+    int[] tokens;
+    byte[] scratch;
+    // MemorySegments over tokens and scratch for the native calls
+    private Object tokensSegment;
+    private Object scratchSegment;
+    /** The field names the native side interned, by id. */
+    private String[] names = new String[256];
     String[] contextNames = new String[32];
     boolean[] contextArrays = new boolean[32];
 
-    private volatile boolean inUse;
+    /**
+     * Whether a parser holds this state. Only the owning thread sets it; a parser closed on another thread may leave
+     * it set as far as the owning thread sees, which then uses Jackson, so it needs no memory barrier.
+     */
+    private boolean inUse;
 
     private SimdJsonParserState(Object context) {
         this.context = context;
         this.contextCapacity = INITIAL_CAPACITY;
+        setTokens(new int[4 * 1024]);
+        setScratch(new byte[INITIAL_CAPACITY]);
+    }
+
+    private void setTokens(int[] tokens) {
+        this.tokens = tokens;
+        this.tokensSegment = SimdJsonNative.segment(tokens);
+    }
+
+    private void setScratch(byte[] scratch) {
+        this.scratch = scratch;
+        this.scratchSegment = SimdJsonNative.segment(scratch);
     }
 
     /** Returns this thread's state if it is free, after marking it in use, or null. */
@@ -70,12 +90,14 @@ final class SimdJsonParserState {
      * parse the document.
      */
     int tokenize(byte[] buf, int offset, int length) {
-        if (scratch.length < length) {
-            scratch = new byte[Math.max(length, scratch.length * 2)];
+        // decoded strings are never longer than the source, plus 4 bytes per decoded field name
+        int scratchLength = 2 * length + 8;
+        if (scratch.length < scratchLength) {
+            setScratch(new byte[Math.max(scratchLength, scratch.length * 2)]);
         }
         if (tokens.length < length) {
             // Room for one token every 4 bytes; denser documents retry below.
-            tokens = new int[Math.max(length, tokens.length * 2)];
+            setTokens(new int[Math.max(length, tokens.length * 2)]);
         }
         if (length > contextCapacity) {
             contextCapacity = length;
@@ -86,8 +108,9 @@ final class SimdJsonParserState {
                 buf,
                 offset,
                 length,
-                tokens,
-                scratch,
+                tokensSegment,
+                tokens.length,
+                scratchSegment,
                 XContentConstraints.DEFAULT_MAX_DEPTH,
                 XContentConstraints.DEFAULT_MAX_NAME_LEN,
                 XContentConstraints.DEFAULT_MAX_STRING_LEN
@@ -95,7 +118,7 @@ final class SimdJsonParserState {
             if (n != SimdJsonNative.OUTPUT_TOO_SMALL) {
                 return n;
             }
-            tokens = new int[Math.max(tokens.length * 2, 4 * (length + 1))];
+            setTokens(new int[Math.max(tokens.length * 2, 4 * (length + 1))]);
         }
     }
 
@@ -106,57 +129,27 @@ final class SimdJsonParserState {
             }
         }
         if (tokens.length > RETAINED_DOCUMENT_BYTES) {
-            tokens = new int[4 * 1024];
+            setTokens(new int[4 * 1024]);
         }
         if (scratch.length > RETAINED_DOCUMENT_BYTES) {
-            scratch = new byte[INITIAL_CAPACITY];
+            setScratch(new byte[INITIAL_CAPACITY]);
         }
         inUse = false;
     }
 
-    /** Field names by their UTF-8 bytes, so that a document mentioning a field reuses its String. */
-    static final class NameCache {
-        private static final int SIZE = 4096;
-        private static final int MASK = SIZE - 1;
-        private static final int MAX_LENGTH = 256;
-        private final byte[][] keys = new byte[SIZE][];
-        private final String[] values = new String[SIZE];
-        private final int[] hashes = new int[SIZE];
-        private int count;
-
-        /** The name buf[start, start + length), whose hash is hash. */
-        String lookup(byte[] buf, int start, int length, int hash) {
-            if (length > MAX_LENGTH) {
-                return new String(buf, start, length, StandardCharsets.UTF_8);
-            }
-            int slot = hash & MASK;
-            for (int probe = 0; probe < 8; probe++) {
-                byte[] key = keys[slot];
-                if (key == null) {
-                    String value = new String(buf, start, length, StandardCharsets.UTF_8);
-                    if (count < SIZE / 2) {
-                        keys[slot] = Arrays.copyOfRange(buf, start, start + length);
-                        values[slot] = value;
-                        hashes[slot] = hash;
-                        count++;
-                    }
-                    return value;
-                }
-                if (hashes[slot] == hash && key.length == length && Arrays.equals(key, 0, length, buf, start, start + length)) {
-                    return values[slot];
-                }
-                slot = (slot + 1) & MASK;
-            }
-            return new String(buf, start, length, StandardCharsets.UTF_8);
+    /** The field name bytes[start, start + length), whose id the native side assigned (-1 when it has none). */
+    String name(int id, byte[] bytes, int start, int length) {
+        if (id < 0) {
+            return new String(bytes, start, length, StandardCharsets.UTF_8);
         }
-
-        /** Lookup for a name decoded from escapes, which the native side does not hash. */
-        String lookup(byte[] buf, int start, int length) {
-            int hash = 1;
-            for (int i = start, end = start + length; i < end; i++) {
-                hash = 31 * hash + buf[i];
-            }
-            return lookup(buf, start, length, hash ^ (hash >>> 16));
+        if (id >= names.length) {
+            names = Arrays.copyOf(names, Math.max(id + 1, names.length * 2));
         }
+        String name = names[id];
+        if (name == null) {
+            name = new String(bytes, start, length, StandardCharsets.UTF_8);
+            names[id] = name;
+        }
+        return name;
     }
 }

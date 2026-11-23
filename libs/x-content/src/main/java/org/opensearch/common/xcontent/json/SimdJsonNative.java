@@ -49,11 +49,14 @@ final class SimdJsonNative {
     private static final MethodHandle TOKENIZE;
     private static final MethodHandle SET_CAPACITY;
     private static final MethodHandle SEGMENT_ADDRESS;
+    private static final MethodHandle OF_INTS;
+    private static final MethodHandle OF_BYTES;
     private static final String IMPLEMENTATION;
     private static final String UNAVAILABLE_REASON;
 
     static {
         MethodHandle create = null, destroy = null, tokenize = null, setCapacity = null, segmentAddress = null;
+        MethodHandle ofInts = null, ofBytes = null;
         String implementation = null;
         String reason = null;
         try {
@@ -96,9 +99,10 @@ final class SimdJsonNative {
                     int.class
                 )
             );
-            raw = MethodHandles.filterArguments(raw, 1, ffm.ofBytes);
-            raw = MethodHandles.filterArguments(raw, 4, ffm.ofInts);
-            tokenize = MethodHandles.filterArguments(raw, 6, ffm.ofBytes);
+            // the document is wrapped on each call; the token and scratch arrays are wrapped once by segment()
+            tokenize = MethodHandles.filterArguments(raw, 1, ffm.ofBytes);
+            ofInts = ffm.ofInts;
+            ofBytes = ffm.ofBytes;
             segmentAddress = ffm.segmentAddress;
             implementation = ffm.cString(name.invoke());
         } catch (Throwable t) {
@@ -110,6 +114,8 @@ final class SimdJsonNative {
         TOKENIZE = tokenize;
         SET_CAPACITY = setCapacity;
         SEGMENT_ADDRESS = segmentAddress;
+        OF_INTS = ofInts;
+        OF_BYTES = ofBytes;
         IMPLEMENTATION = implementation;
         UNAVAILABLE_REASON = reason;
     }
@@ -156,6 +162,15 @@ final class SimdJsonNative {
         }
     }
 
+    /** A MemorySegment over the array (an int[] or a byte[]), for {@link #tokenize}. */
+    static Object segment(Object array) {
+        try {
+            return array instanceof int[] ? OF_INTS.invokeExact(array) : OF_BYTES.invokeExact(array);
+        } catch (Throwable t) {
+            throw new AssertionError(t);
+        }
+    }
+
     /**
      * Tokenizes buf[offset, offset + length) into out (4 ints per token) and scratch (decoded strings).
      * Returns the number of tokens, {@link #OUTPUT_TOO_SMALL}, {@link #FALLBACK}, or another negative
@@ -166,8 +181,9 @@ final class SimdJsonNative {
         byte[] buf,
         int offset,
         int length,
-        int[] out,
-        byte[] scratch,
+        Object out,
+        int outLength,
+        Object scratch,
         int maxDepth,
         int maxNameLength,
         int maxStringLength
@@ -178,9 +194,9 @@ final class SimdJsonNative {
                 (Object) buf,
                 offset,
                 length,
-                (Object) out,
-                out.length,
-                (Object) scratch,
+                out,
+                outLength,
+                scratch,
                 maxDepth,
                 maxNameLength,
                 maxStringLength

@@ -28,6 +28,8 @@ import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.MapperExtrasModulePlugin;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.mapper.Mapping;
+import org.opensearch.index.mapper.ParsedDocument;
 import org.opensearch.index.mapper.SourceToParse;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.indices.IndicesModule;
@@ -96,7 +98,22 @@ public class DocumentParsingBenchmark {
         }
         documents = docs.toArray(new BytesReference[0]);
         String mapping = Files.readString(dir.resolve(workload + ".mapping.json"), StandardCharsets.UTF_8);
-        mapper = createMapperService(mapping).documentMapper();
+        MapperService mapperService = createMapperService(mapping);
+        // Apply the dynamic mapping updates, as the cluster would after the first documents, so that the
+        // benchmark measures the steady state.
+        for (int i = 0; i < documents.length; i++) {
+            ParsedDocument parsed = mapperService.documentMapper()
+                .parse(new SourceToParse("index", Integer.toString(i), documents[i], MediaTypeRegistry.JSON));
+            Mapping update = parsed.dynamicMappingsUpdate();
+            if (update != null) {
+                mapperService.merge(
+                    MapperService.SINGLE_MAPPING_NAME,
+                    new CompressedXContent(update.toString()),
+                    MapperService.MergeReason.MAPPING_UPDATE
+                );
+            }
+        }
+        mapper = mapperService.documentMapper();
         System.out.println("\n" + workload + ": " + documents.length + " documents, simdjson " + JsonXContent.simdJsonStatus());
     }
 
@@ -121,7 +138,9 @@ public class DocumentParsingBenchmark {
             NamedXContentRegistry.EMPTY,
             new SimilarityService(indexSettings, scriptService, Collections.emptyMap()),
             new IndicesModule(List.of(new MapperExtrasModulePlugin())).getMapperRegistry(),
-            () -> { throw new UnsupportedOperationException(); },
+            () -> {
+                throw new UnsupportedOperationException();
+            },
             () -> true,
             scriptService
         );
