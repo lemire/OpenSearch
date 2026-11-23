@@ -65,6 +65,15 @@ public interface DateFormatter {
     TemporalAccessor parse(String input);
 
     /**
+     * Parses the input into an instant, resolving a date without an offset in UTC, as
+     * {@code DateFormatters.from(parse(input), locale()).toInstant()} does, but faster for the common shapes of
+     * dates. Returns null when the caller must use {@link #parse(String)}, which then gives the result or the error.
+     */
+    default Instant parseInstantFast(String input) {
+        return null;
+    }
+
+    /**
      * Parse the given input into millis-since-epoch.
      */
     default long parseMillis(String input) {

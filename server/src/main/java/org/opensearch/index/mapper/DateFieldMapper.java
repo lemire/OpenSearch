@@ -504,7 +504,11 @@ public final class DateFieldMapper extends ParametrizedFieldMapper {
 
         // Visible for testing.
         public long parse(String value) {
-            return resolution.convert(DateFormatters.from(dateTimeFormatter().parse(value), dateTimeFormatter().locale()).toInstant());
+            Instant instant = dateTimeFormatter().parseInstantFast(value);
+            if (instant == null) {
+                instant = DateFormatters.from(dateTimeFormatter().parse(value), dateTimeFormatter().locale()).toInstant();
+            }
+            return resolution.convert(instant);
         }
 
         public long convertNanosToMillis(long nanoSecondsSinceEpoch) {

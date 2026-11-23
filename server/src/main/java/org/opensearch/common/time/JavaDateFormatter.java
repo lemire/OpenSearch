@@ -37,7 +37,9 @@ import org.opensearch.core.common.Strings;
 
 import java.text.ParsePosition;
 import java.time.DateTimeException;
+import java.time.Instant;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
@@ -393,6 +395,21 @@ class JavaDateFormatter implements DateFormatter {
     @Override
     public ZoneId zone() {
         return this.printer.getZone();
+    }
+
+    /** The fast parser for this format, built on first use; null when there is none. */
+    private FastDateParser fastParser;
+    private volatile boolean fastParserBuilt;
+
+    @Override
+    public Instant parseInstantFast(String input) {
+        if (fastParserBuilt == false) {
+            ZoneId zone = zone();
+            // a formatter with another zone resolves dates without offsets in that zone
+            fastParser = zone == null || ZoneOffset.UTC.equals(zone) ? FastDateParser.forFormat(format) : null;
+            fastParserBuilt = true;
+        }
+        return fastParser == null || input == null ? null : fastParser.parse(input);
     }
 
     @Override
